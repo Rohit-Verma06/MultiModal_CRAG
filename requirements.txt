@@ -1,0 +1,24 @@
+# --- Web Framework & Server ---
+fastapi
+uvicorn
+python-multipart
+
+# --- Frontend ---
+streamlit
+requests
+
+# --- AI & Agent Logic ---
+langgraph
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+tavily-python
+
+# --- Document Processing & Vector Store ---
+pymupdf
+faiss-cpu
+
+# --- Utilities ---
+python-dotenv
+pydantic

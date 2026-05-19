@@ -1,0 +1,15 @@
+# Environments
+venv/
+blog_env/
+venv_chatbot/
+env/
+
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/

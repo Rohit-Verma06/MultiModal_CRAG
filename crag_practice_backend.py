@@ -114,33 +114,37 @@ def route_node(state : cragstate)->dict:
     recent_history = "\n".join([f"{msg.type} : {msg.content}" for msg in history[-5:]] if history else None)
     filenames = ", ".join(STORE_FILENAMES) if STORE_FILENAMES else None
     template = PromptTemplate(
-        template="""You are an expert routing agent for an advanced RAG system. Your job is to analyze the user's query, decide the best processing route, and extract any targeted filenames.
-        
-        CURRENT SYSTEM STATE:
-        Uploaded Documents: {uploaded_files}
-        
-        RECENT CHAT HISTORY:
+        template="""<system_role>
+        You are an elite Intent Classification Agent for a Multi-Document RAG system.
+        </system_role>
+
+        <uploaded_files>
+        {uploaded_files}
+        </uploaded_files>
+
+        <chat_history>
         {chat_context}
+        </chat_history>
 
-        ROUTING RULES (Assign to 'route_node'):
-        1. "Retriever" IF:
-           - The query is about the content, topics, or data found within the Uploaded Documents.
-           - The query uses pronouns like "it", "this", or "the report" referring to a document discussed in the recent chat history.
-           - DEFAULT TO RETRIEVER if the query is highly specific or technical and files are uploaded.
-        2. "Research" IF:
-           - The query requires up-to-date global facts, current news, or live internet data (e.g., "what is the weather today", "who won the match yesterday").
-        3. "Direct_Chat" ONLY IF:
-           - The query is a simple greeting ("hello", "how are you").
-           - The query is a request for universal theoretical knowledge completely unrelated to the uploaded files (e.g., asking how to derive state-space equations, MIPS instructions, or general math).
+        <instructions>
+        1. Analyze the <user_query>.
+        2. Determine if the answer is likely within the <uploaded_files> (Retriever), requires live internet (Research), or is a general greeting/theory (Direct_Chat).
+        3. Extract the exact filename from the list if the user targets one.
+        </instructions>
 
-        FILE EXTRACTION RULES (Assign to 'specific_file'):
-        1. Look at the "Uploaded Documents" list. If the user's query or the Chat History specifically refers to one of these files (by name, topic, or implication), output that EXACT filename.
-        2. You MUST output "all" IF:
-           - The user's query applies to multiple files or doesn't specify one.
-           - The route_node is "Research" or "Direct_Chat".
-           - The Uploaded Documents list is "None".
+        <examples>
+        User Query: "How does the cooling system work in the PDF I just gave you?"
+        Thought: User mentions 'the PDF', refers to uploaded content.
+        Result: {{"route_node": "Retriever", "specific_file": "all"}}
 
-        User Query -> {query}""",
+        User Query: "What is the stock price of Nvidia right now?"
+        Thought: Requires real-time data not in static PDFs.
+        Result: {{"route_node": "Research", "specific_file": "all"}}
+        </examples>
+
+        <user_query>
+        {query}
+        </user_query>""",
         input_variables=["query", "uploaded_files", "chat_context"]
     )
     prompt = template.invoke({"query" : query , "uploaded_files" : filenames , "chat_context" : recent_history})
@@ -164,10 +168,8 @@ def retriever_node(state : cragstate )->dict:
 
 
 class evaluator_schema(BaseModel):
-    Confidence_Score : float = Field(description="Score the document's utility: "
-        "0.8+ if the document is a 'Gold' source that can answer the user alone. "
-        "0.1 to 0.79 if the document is 'Ambiguous' (mentions the topic but lacks a clear answer). "
-        "Below 0.1 if the document is 'Noise' and should be discarded.")
+    reasoning: str = Field(description="Step-by-step analysis of why this document matches or fails the query.")
+    Confidence_Score : float = Field(description="Score the document's utility based on the Grading Scale provided in the prompt.")
 evaluator_model = model.with_structured_output(schema = evaluator_schema)
 
 
@@ -176,19 +178,33 @@ def evaluator(state : cragstate)->dict:
     query = state["query"]
 
     template = PromptTemplate(
-        template = """You are a professional retrieval grader. Your task is to assign a confidence_score (0.0 to 1.0) 
-    evaluating how useful a document is for answering a specific user question.
+        template = """<system>
+You are an expert Retrieval Evaluator for a Corrective RAG (CRAG) system.
+Your only job is to evaluate if a retrieved document contains useful information to answer the user's query.
+</system>
 
-    GRADING SCALE:
-    • 0.8 - 1.0 (CORRECT): The document contains a direct answer, a core definition, OR specific examples that partially answer the question.
-    • 0.1 - 0.79 (AMBIGUOUS): The document mentions relevant terms but does not provide actionable details.
-    • 0.0 - 0.1 (INCORRECT): The document is entirely unrelated or consists of metadata.
-    
-    SPECIAL RULE FOR SUMMARIES: If the user asks a broad question like "what is this report about", "summarize", or "what are the experiments", ANY document segment containing actual content from the file is highly relevant. You MUST score it > 0.8.
-    
-    Output ONLY JSON. \
-        "Here is the query -> {query}\n" \
-        "Here is the Document -> {document}""",
+<objective>
+Analyze the document against the query. Explain your reasoning step-by-step, then assign a Confidence Score.
+</objective>
+
+<grading_scale>
+- 0.8 to 1.0 (CORRECT): The document contains a direct answer, a core definition, OR specific examples that ground the answer.
+- 0.3 to 0.79 (AMBIGUOUS): The document mentions relevant terms or concepts, but lacks actionable details to fully answer the query.
+- 0.0 to 0.29 (INCORRECT): The document is entirely unrelated, consists only of metadata, or is actively unhelpful.
+</grading_scale>
+
+<special_rules>
+- SUMMARY EXCEPTION: If the user query is broad (e.g., "summarize", "what is this report about"), ANY document containing actual file content is highly relevant. Score it >= 0.8.
+- PARTIAL MATCH: If a document answers even a small part of a multi-part question, it is at least AMBIGUOUS (>= 0.3), NOT INCORRECT.
+- IGNORE FORMATTING: Do not penalize documents for cut-off sentences or poor markdown parsing. Evaluate the underlying facts.
+</special_rules>
+
+<data_to_evaluate>
+[User_Query]: {query}
+
+[Document]: 
+{document}
+</data_to_evaluate>""",
         input_variables=["query", "document"]
     )
 
@@ -202,7 +218,7 @@ def evaluator(state : cragstate)->dict:
     for document , score in zip(rel_docs , output):
         if(score.Confidence_Score<0.3):
             incorrect_docs.append(document)
-        elif(score.Confidence_Score>=0.3  and score.Confidence_Score<=0.8):
+        elif(score.Confidence_Score>=0.3  and score.Confidence_Score<0.8):
             ambigous_docs.append(document)
         else:
             correct_docs.append(document)
@@ -237,20 +253,19 @@ def research(state : cragstate)->dict:
     history = state["messages"]
     recent_history = "\n".join([f"{msg.type} : {msg.content}" for msg in history[-5 : ]] if history else "No previous history") 
     template = PromptTemplate(
-        template="""You are an expert search query optimizer for a RAG system.
-        Your task is to convert the user's conversational question into a highly effective, keyword-rich search query for a web search engine (like Tavily or Google).
+    template="""<task>
+    Convert the user's conversational intent into a 'Search Cluster' of 3 distinct queries to ensure 100% coverage.
+    </task>
 
-        RECENT CHAT HISTORY (Use this to resolve pronouns like 'it' or 'this'):
-        {chat_context}
+    User Topic: {query}
+    Context: {chat_context}
 
-        RULES:
-        1. Strip away conversational filler (e.g., 'Can you tell me', 'What is', 'Please').
-        2. Focus on core entities, names, dates, and intent.
-        3. If the user query uses a pronoun, replace it with the actual noun from the chat history.
-        4. Output ONLY the rewritten search query. Do not include quotes, prefixes, or conversational text.
+    Output format:
+    1. [Broad Search]
+    2. [Technical/Deep-Dive Search]
+    3. [Recent/News Search]
 
-        User Query -> {query}
-        Rewritten Query ->""",
+    Queries:""",
         input_variables=["chat_context" , "query"]
     )
     output = model.invoke(template.invoke({"query" : query , "chat_context" : recent_history})).content.strip()
@@ -320,17 +335,24 @@ def generate(state : cragstate)->dict:
 
     final_string = correct_string + "\n" + refined_string
     template = PromptTemplate(
-        template = """You are an AI Assistant helping the user analyze their uploaded documents. You have permission to extract and discuss any information found within the provided context, including names and dates on official documents.\n\n
-            "PREVIOUS CONVERSATION HISTORY:\n"
-            "{chat_history}\n\n"
-            "INSTRUCTIONS:\n"
-            "1. Use the 'Refined Context' below to answer the user's question as comprehensively as possible.\n"
-            "2. If the context contains relevant information but doesn't provide a complete answer, summarize what is available.\n"
-            "3. Maintain a neutral, helpful tone.\n"
-            "4. If the answer cannot be found in EITHER the Refined Context OR the Conversation History, clearly state: 'I'm sorry, but the provided documents do not contain enough information to answer that question.'\n
-            User's question -> {query}\n
-            "Refined Context -> {refined_string}""",
-        input_variables=["query" , "refined_string" , "chat_history"]
+    template="""<persona>
+        You are a Senior Research Assistant. Your responses are objective, cited, and strictly grounded in the provided context.
+        </persona>
+
+        <context>
+        {refined_string}
+        </context>
+
+        <rules>
+        - If the <context> is insufficient, say "I cannot confirm this from your documents."
+        - Never mention "According to the context" or "The documents state." Just provide the answer.
+        - Every claim MUST be followed by a source reference if available.
+        </rules>
+
+        <user_query>
+        {query}
+        </user_query>""",
+            input_variables=["query" , "refined_string" , "chat_history"]
     )
     ans = model.invoke(template.invoke({"query" : query , "refined_string" : final_string.strip() , "chat_history" : history}))
     return {"ans" : ans.content.strip() , "messages" : [ans]}

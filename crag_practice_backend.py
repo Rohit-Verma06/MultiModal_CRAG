@@ -11,6 +11,7 @@ from langchain_core.prompts import PromptTemplate
 from langgraph.graph.message import add_messages 
 from langchain_core.messages import BaseMessage , HumanMessage
 import re
+import uuid
 import base64 
 from pathlib import Path
 from langgraph.checkpoint.memory import InMemorySaver
@@ -19,8 +20,8 @@ load_dotenv()
 model = ChatOpenAI(model = "gpt-4o-mini", temperature = 0.2)
 image_model = ChatOpenAI(model = "gpt-4o-mini"  , temperature = 0)
 GLOBAL_VECTOR_STORE = None
-STORE_FILENAMES = set()
-# GLOBAL_RETRIEVER = None
+STORE_FILENAMES = []
+GLOBAL_IMAGE_STORE = {}
 
 class cragstate(TypedDict):
     query : str 
@@ -38,6 +39,9 @@ class cragstate(TypedDict):
     research_docs : List[Document] = []
     refined_list_sentences : list = []
     ans : str 
+
+    rel_images : List[str] = []
+    correct_images : List[str] = []
 
 def process_pdf(filepath : str , filename : str):
     global GLOBAL_VECTOR_STORE , STORE_FILENAMES
@@ -59,7 +63,7 @@ def process_pdf(filepath : str , filename : str):
         GLOBAL_VECTOR_STORE.add_documents(chunks)
 
     # GLOBAL_RETRIEVER = GLOBAL_VECTOR_STORE.as_retriever(search_type = "similarity" , search_kwargs = {"k" : 5})
-    STORE_FILENAMES.add(filename)
+    STORE_FILENAMES.append(filename)
     return 
 
 def process_image(filepath : str , filename : str):
@@ -71,8 +75,10 @@ def process_image(filepath : str , filename : str):
         encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
     
     prompt = (
-        f"Extract all the text from this image perfectly. If there are tables, format them clearly using Markdown."
-        f"If there are diagrams,  charts, or UI elements, describe them in detail."
+        f"Analyze this image comprehensively. "
+        f"1. Identify the primary subject. If it is a known public figure, celebrity, historical person, religious deity, mythological figure, or cultural icon, state their specific name explicitly (e.g., 'Lord Hanuman'). "
+        f"2. Describe the scene, objects, and visual context in detail. "
+        f"3. Extract any visible text perfectly. Format tables using Markdown. "
         f"This content is from the file: {filename}"
     )
     extension = Path(filename).suffix.lower().lstrip('.')   # lstrip('.') used for removing left/start/leading '.'
@@ -85,7 +91,10 @@ def process_image(filepath : str , filename : str):
     )
 
     extracted_image_text = image_model.invoke([message]).content
-    doc = [Document(page_content=extracted_image_text , metadata = {"source" : filename})]
+
+    doc_id = str(uuid.uuid4())
+    GLOBAL_IMAGE_STORE[doc_id]  = f"data:image/{clean_extension};base64,{encoded_string}"
+    doc = [Document(page_content=extracted_image_text , metadata = {"source" : filename , "doc_id" : doc_id , "type" : "image"})]
 
     splitter = RecursiveCharacterTextSplitter(separators=["\n\n" , "\n" , " ", ""] ,chunk_size = 1000, chunk_overlap = 200)
     chunks = splitter.split_documents(doc)
@@ -97,8 +106,7 @@ def process_image(filepath : str , filename : str):
         )
     else:
         GLOBAL_VECTOR_STORE.add_documents(chunks)
-    # GLOBAL_RETRIEVER = GLOBAL_VECTOR_STORE.as_retriever(search_type = "similarity" , search_kwargs = {"k" : 5})
-    STORE_FILENAMES.add(filename)
+    STORE_FILENAMES.append(filename)
     return 
         
 
@@ -111,8 +119,11 @@ def route_node(state : cragstate)->dict:
     global STORE_FILENAMES
     query = state["query"]
     history = state["messages"]
-    recent_history = "\n".join([f"{msg.type} : {msg.content}" for msg in history[-5:]] if history else None)
-    filenames = ", ".join(STORE_FILENAMES) if STORE_FILENAMES else None
+    recent_history = "\n".join([f"{msg.type} : {msg.content}" for msg in history[-12:]] if history else None)
+    if STORE_FILENAMES:
+        filenames = "\n".join([f"{i+1}. {filename}" for i  , filename in enumerate(STORE_FILENAMES)])
+    else:
+        filenames = "None"
     template = PromptTemplate(
         template="""<system_role>
         You are an elite Intent Classification Agent for a Multi-Document RAG system.
@@ -130,6 +141,7 @@ def route_node(state : cragstate)->dict:
         1. Analyze the <user_query>.
         2. Determine if the answer is likely within the <uploaded_files> (Retriever), requires live internet (Research), or is a general greeting/theory (Direct_Chat).
         3. Extract the exact filename from the list if the user targets one.
+        4. CRITICAL: If the user says "the image" or "the document" but does not name it, AND there are multiple files uploaded, output "all" to be safe.
         </instructions>
 
         <examples>
@@ -150,6 +162,7 @@ def route_node(state : cragstate)->dict:
     prompt = template.invoke({"query" : query , "uploaded_files" : filenames , "chat_context" : recent_history})
     output = route_model.invoke(prompt)
     state["specific_file"] = output.specific_file
+    # print(f"🧭 ROUTER DECISION: Route to '{output.route_node}' for file '{output.specific_file}'") 
     return {"route_node" : output.route_node}
 
 def routing_condition(state : cragstate)->Literal["Retriever" , "Direct_Chat" , "Research"]:
@@ -160,56 +173,71 @@ def retriever_node(state : cragstate )->dict:
     specific_file = state.get("specific_file" , "all")
     if(not GLOBAL_VECTOR_STORE):
         return {"rel_docs"  : []}
+    if specific_file not in STORE_FILENAMES and specific_file.lower().strip() != "all":
+        print(f"⚠️ Router hallucinated file '{specific_file}'. Defaulting to 'all'.")
+        specific_file = 'all'
+
     if(specific_file.lower().strip() != "all"):
-        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,k = 5,  filter = {"source" : specific_file})
+        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,k = 10,  filter = {"source" : specific_file})
     else:
-        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,  k = 5)
-    return {"rel_docs" : rel_docs}
+        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,  k = 10)
 
+    retrieved_images = []
+    for doc in rel_docs:
+        if doc.metadata.get("type") == "image" and "doc_id" in doc.metadata:
+            image = GLOBAL_IMAGE_STORE.get(doc.metadata["doc_id"])
+            if image and image not in retrieved_images:
+                retrieved_images.append(image)
+    return {"rel_docs" : rel_docs , "rel_images" : retrieved_images}
 
+    
 class evaluator_schema(BaseModel):
-    reasoning: str = Field(description="Step-by-step analysis of why this document matches or fails the query.")
+    reasoning: str = Field(description="Step-by-step analysis of why this document matches or fails the query.") 
     Confidence_Score : float = Field(description="Score the document's utility based on the Grading Scale provided in the prompt.")
 evaluator_model = model.with_structured_output(schema = evaluator_schema)
 
+class image_evaluator_schema(BaseModel):
+    Grade : Literal["CORRECT" , "INCORRECT"] = Field(description="Grading of the document relative to the user's query")
+img_eval_model = model.with_structured_output(schema = image_evaluator_schema)
 
 def evaluator(state : cragstate)->dict:
     rel_docs = state.get("rel_docs" , [])
     query = state["query"]
+    rel_images = state.get("rel_images" , [])
 
     template = PromptTemplate(
         template = """<system>
-You are an expert Retrieval Evaluator for a Corrective RAG (CRAG) system.
-Your only job is to evaluate if a retrieved document contains useful information to answer the user's query.
-</system>
+        You are an expert Retrieval Evaluator for a Corrective RAG (CRAG) system.
+        Your only job is to evaluate if a retrieved document contains useful information to answer the user's query.
+        </system>
 
-<objective>
-Analyze the document against the query. Explain your reasoning step-by-step, then assign a Confidence Score.
-</objective>
+        <objective>
+        Analyze the document against the query. Explain your reasoning step-by-step, then assign a Confidence Score.
+        </objective>
 
-<grading_scale>
-- 0.8 to 1.0 (CORRECT): The document contains a direct answer, a core definition, OR specific examples that ground the answer.
-- 0.3 to 0.79 (AMBIGUOUS): The document mentions relevant terms or concepts, but lacks actionable details to fully answer the query.
-- 0.0 to 0.29 (INCORRECT): The document is entirely unrelated, consists only of metadata, or is actively unhelpful.
-</grading_scale>
+        <grading_scale>
+        - 0.8 to 1.0 (CORRECT): The document contains a direct answer, a core definition, OR specific examples that ground the answer.
+        - 0.3 to 0.79 (AMBIGUOUS): The document mentions relevant terms or concepts, but lacks actionable details to fully answer the query.
+        - 0.0 to 0.29 (INCORRECT): The document is entirely unrelated, consists only of metadata, or is actively unhelpful.
+        </grading_scale>
 
-<special_rules>
-- SUMMARY EXCEPTION: If the user query is broad (e.g., "summarize", "what is this report about"), ANY document containing actual file content is highly relevant. Score it >= 0.8.
-- PARTIAL MATCH: If a document answers even a small part of a multi-part question, it is at least AMBIGUOUS (>= 0.3), NOT INCORRECT.
-- IGNORE FORMATTING: Do not penalize documents for cut-off sentences or poor markdown parsing. Evaluate the underlying facts.
-</special_rules>
+        <special_rules>
+        - SUMMARY EXCEPTION: If the user query is broad (e.g., "summarize", "what is this report about"), ANY document containing actual file content is highly relevant. Score it >= 0.8.
+        - PARTIAL MATCH: If a document answers even a small part of a multi-part question, it is at least AMBIGUOUS (>= 0.3), NOT INCORRECT.
+        - IGNORE FORMATTING: Do not penalize documents for cut-off sentences or poor markdown parsing. Evaluate the underlying facts.
+        </special_rules>
 
-<data_to_evaluate>
-[User_Query]: {query}
+        <data_to_evaluate>
+        [User_Query]: {query}
 
-[Document]: 
-{document}
-</data_to_evaluate>""",
+        [Document]: 
+        {document}
+        </data_to_evaluate>""",
         input_variables=["query", "document"]
     )
 
     evaluator_chain = template | evaluator_model
-    batch_input = [{"query" : query , "document" : doc.page_content} for doc in rel_docs]
+    batch_input = [{"query" : query , "document" : f"[Source File : {doc.metadata.get('source' , 'unknown')}] \n{doc.page_content}"} for doc in rel_docs]
     output = evaluator_chain.batch(batch_input)
 
     correct_docs = []
@@ -223,21 +251,60 @@ Analyze the document against the query. Explain your reasoning step-by-step, the
         else:
             correct_docs.append(document)
     
-    return {"correct_docs" : correct_docs  , "ambigous_docs" : ambigous_docs , "incorrect_docs" : incorrect_docs}
+
+    correct_images = []
+
+    img_template_text = """<system>
+        You are an expert Visual Retrieval Evaluator. 
+        Look at the provided image.
+        </system>
+        
+        <grading_scale>
+        - CORRECT: The image depicts the primary subject of the user's query (e.g., it is a photo of the person/object they are asking about) OR it contains charts/text that help answer the query.
+        - INCORRECT: The image is entirely unrelated noise.
+        </grading_scale>
+        
+        <rules>
+        You MUST respond with exactly one word: CORRECT or INCORRECT.
+        </rules>"""
+    batch_messages = []
+    for img in rel_images:
+        batch_messages.append([HumanMessage(
+            content = [{
+                "type" : "text",
+                "text" : img_template_text + f"\n\n[User Query]: {query}"
+            },
+            {"type" : "image_url", "image_url" : {"url" : img}}]
+        )])
+        
+    img_output = img_eval_model.batch(batch_messages)
+
+    for img , grade in zip(rel_images , img_output):
+        if grade.Grade.strip().upper() == "CORRECT":
+            correct_images.append(img)
+    return {"correct_images" : correct_images , "correct_docs" : correct_docs  , "ambigous_docs" : ambigous_docs , "incorrect_docs" : incorrect_docs}
 
 
 def check_condition(state: cragstate)->Literal["Research" , "Refine"]:
     global GLOBAL_VECTOR_STORE
     if(not GLOBAL_VECTOR_STORE):
         return "Refine"
-    if(not state.get("correct_docs" , []) and not state.get("ambigous_docs" , [])):
-        return "Research"
-    elif(not state.get("correct_docs" , []) and state.get("ambigous_docs" , [])):
-        return "Research"
-    elif(state.get("correct_docs" , []) and not state.get("ambigous_docs" , [])):
+    correct_docs = state.get("correct_docs" , [])
+    # ambigous_docs = state.get("ambigous_docs" , [])
+    correct_images = state.get("correct_images" ,[])
+
+    if correct_docs or correct_images:
         return "Refine"
-    else:
-        return "Refine"
+    
+    return "Research"
+    # if(not state.get("correct_docs" , []) and not state.get("ambigous_docs" , []) and not state.get("correct_images" ,[])):
+    #     return "Research"
+    # elif(not state.get("correct_docs" , []) and state.get("ambigous_docs" , [])):
+    #     return "Research"
+    # elif(state.get("correct_docs" , []) and not state.get("ambigous_docs" , [])):
+    #     return "Refine"
+    # else:
+    #     return "Refine"
 
 
 tool = TavilySearchResults(max_results = 5)
@@ -328,33 +395,44 @@ def generate(state : cragstate)->dict:
 
     history = "\n".join([f"{el.type} : {el.content}" for el in history])
     query = state["query"]
+    
+    file_list_str = "\n".join([f"{i+1}. {filename}" for i,filename in enumerate(STORE_FILENAMES)]) if STORE_FILENAMES else "None"
+
+
     refined_sentences = state.get("refined_list_sentences" ,[])
     correct_docs = state.get("correct_docs" , [])
-    correct_string = " ".join(doc.page_content for doc in correct_docs).strip()
+    correct_texts = [f"[From File: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}" for doc in correct_docs]
+    correct_images = state.get("correct_images" , [])
+    correct_string = "\n\n".join(correct_texts).strip()
     refined_string = " ".join(sentence for sentence in refined_sentences).strip()
 
-    final_string = correct_string + "\n" + refined_string
-    template = PromptTemplate(
-    template="""<persona>
-        You are a Senior Research Assistant. Your responses are objective, cited, and strictly grounded in the provided context.
-        </persona>
+    final_string = correct_string + "\n\n" + refined_string
+    system_text = f"""<persona>
+    You are a Senior Research Assistant. Your responses are objective, cited, and strictly grounded in the provided context and images.
+    </persona>
+    
+    <uploaded_file_directory>
+    {file_list_str}
+    </uploaded_file_directory>
 
-        <context>
-        {refined_string}
-        </context>
+    <context>
+    {final_string}
+    </context>
 
-        <rules>
-        - If the <context> is insufficient, say "I cannot confirm this from your documents."
-        - Never mention "According to the context" or "The documents state." Just provide the answer.
-        - Every claim MUST be followed by a source reference if available.
-        </rules>
+    <rules>
+    - If the user asks about a specific file (e.g., "the second file"), use the <uploaded_file_directory> to map it to the correct context.
+    - If the <context> and images are insufficient, say "I cannot confirm this from your documents."
+    - Never mention "According to the context". Just provide the answer.
+    </rules>
 
-        <user_query>
-        {query}
-        </user_query>""",
-            input_variables=["query" , "refined_string" , "chat_history"]
-    )
-    ans = model.invoke(template.invoke({"query" : query , "refined_string" : final_string.strip() , "chat_history" : history}))
+    <user_query>
+    {query}
+    </user_query>"""
+    content_payload = [{"type" : "text" , "text" : system_text}]
+    for img in correct_images:
+        content_payload.append({"type" : "image_url" , "image_url" : {"url" : img}})
+
+    ans = model.invoke([HumanMessage(content = content_payload)])
     return {"ans" : ans.content.strip() , "messages" : [ans]}
 
 def Direct_Chat(state: cragstate)->dict:

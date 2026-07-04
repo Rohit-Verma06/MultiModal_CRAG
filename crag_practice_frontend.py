@@ -5,7 +5,7 @@ import requests
 st.set_page_config(page_title="AI Research Assistant", page_icon="🧠", layout="wide")
 st.title("🧠 AI Research Assistant (CRAG)")
 
-# The address of your new FastAPI server!
+# The address of your FastAPI server
 API_URL = "http://127.0.0.1:8000"
 
 # --- SIDEBAR: FILE UPLOADER ---
@@ -55,29 +55,32 @@ if prompt := st.chat_input("Ask a question about your documents, or search the w
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2. Call the FastAPI backend
+    # 2. Call the FastAPI backend with streaming enabled
     with st.chat_message("assistant"):
-        with st.spinner("Server is thinking..."):
+        payload = {
+            "query": prompt, 
+            "thread_id": "session_1"
+        }
+        
+        try:
+            # Send the request with stream=True
+            response = requests.post(f"{API_URL}/chat", json=payload, stream=True)
             
-            # Package the query into a JSON dictionary
-            payload = {
-                "query": prompt, 
-                "thread_id": "session_1"
-            }
-            
-            try:
-                # POST the question to your FastAPI /chat endpoint
-                response = requests.post(f"{API_URL}/chat", json=payload)
+            if response.status_code == 200:
+                # Helper generator function to read chunks from the stream
+                def response_generator():
+                    # Read incoming chunks as decoded UTF-8 text
+                    for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                        if chunk:
+                            yield chunk
+
+                # st.write_stream consumes the generator and animates text naturally
+                bot_answer = st.write_stream(response_generator())
                 
-                if response.status_code == 200:
-                    # Extract the answer from the FastAPI JSON response
-                    # (This matches the {"answer": output.get("ans")} you just wrote!)
-                    bot_answer = response.json().get("answer", "Error: No answer key found.")
-                    
-                    st.markdown(bot_answer)
-                    st.session_state.messages.append({"role": "assistant", "content": bot_answer})
-                else:
-                    st.error(f"❌ The server encountered an error: {response.status_code}")
-                    
-            except requests.exceptions.ConnectionError:
-                st.error("❌ Could not connect to the FastAPI server. Is it running?") 
+                # Append the completed answer to history once streaming finishes
+                st.session_state.messages.append({"role": "assistant", "content": bot_answer})
+            else:
+                st.error(f"❌ The server encountered an error: {response.status_code}")
+                
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Could not connect to the FastAPI server. Is it running?")

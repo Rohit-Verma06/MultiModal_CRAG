@@ -13,6 +13,7 @@ from langchain_core.messages import BaseMessage , HumanMessage
 import re
 import uuid
 import base64 
+import asyncio
 from pathlib import Path
 from langgraph.checkpoint.memory import InMemorySaver
 from dotenv import load_dotenv
@@ -43,37 +44,38 @@ class cragstate(TypedDict):
     rel_images : List[str] = []
     correct_images : List[str] = []
 
-def process_pdf(filepath : str , filename : str):
+async def process_pdf(filepath : str , filename : str):
     global GLOBAL_VECTOR_STORE , STORE_FILENAMES
     if(filename in STORE_FILENAMES):
         return 
     
     loader = PyMuPDFLoader(filepath)
-    docs = loader.load()
+    docs = await asyncio.to_thread(loader.load)
     for doc in docs:
         doc.metadata = {"source" : filename}
     splitter = RecursiveCharacterTextSplitter(separators = ["\n\n" , "\n" , " " , ""] , chunk_size = 1000, chunk_overlap = 200)
     chunks = splitter.split_documents(docs)
     if(not GLOBAL_VECTOR_STORE):
-        GLOBAL_VECTOR_STORE = FAISS.from_documents(
+        GLOBAL_VECTOR_STORE = await FAISS.afrom_documents(
             embedding = OpenAIEmbeddings(),
             documents = chunks
         )
     else:
-        GLOBAL_VECTOR_STORE.add_documents(chunks)
+        await GLOBAL_VECTOR_STORE.aadd_documents(chunks)
 
     # GLOBAL_RETRIEVER = GLOBAL_VECTOR_STORE.as_retriever(search_type = "similarity" , search_kwargs = {"k" : 5})
     STORE_FILENAMES.append(filename)
     return 
 
-def process_image(filepath : str , filename : str):
+async def process_image(filepath : str , filename : str):
     global GLOBAL_VECTOR_STORE , STORE_FILENAMES
     if(filename in STORE_FILENAMES):
         return 
+    def read_image():
+        with open(filepath , "rb") as image_file:
+            return  base64.b64encode(image_file.read()).decode("utf-8")
     
-    with open(filepath , "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    
+    encoded_string = await asyncio.to_thread(read_image)
     prompt = (
         f"Analyze this image comprehensively. "
         f"1. Identify the primary subject. If it is a known public figure, celebrity, historical person, religious deity, mythological figure, or cultural icon, state their specific name explicitly (e.g., 'Lord Hanuman'). "
@@ -89,8 +91,8 @@ def process_image(filepath : str , filename : str):
             {"type" : "image_url" , "image_url" : {"url" : f"data:image/{clean_extension};base64,{encoded_string}"} } 
         ]
     )
-
-    extracted_image_text = image_model.invoke([message]).content
+    extracted_image_response = await image_model.ainvoke([message])
+    extracted_image_text = extracted_image_response.content
 
     doc_id = str(uuid.uuid4())
     GLOBAL_IMAGE_STORE[doc_id]  = f"data:image/{clean_extension};base64,{encoded_string}"
@@ -100,12 +102,12 @@ def process_image(filepath : str , filename : str):
     chunks = splitter.split_documents(doc)
 
     if(not GLOBAL_VECTOR_STORE):
-        GLOBAL_VECTOR_STORE = FAISS.from_documents(
+        GLOBAL_VECTOR_STORE = await FAISS.afrom_documents(
             embedding=OpenAIEmbeddings(),
             documents=chunks
         )
     else:
-        GLOBAL_VECTOR_STORE.add_documents(chunks)
+        await GLOBAL_VECTOR_STORE.aadd_documents(chunks)
     STORE_FILENAMES.append(filename)
     return 
         
@@ -115,7 +117,7 @@ class route_schema(BaseModel):
     specific_file : str = Field(description = "The specific file name mentioned or implied in the query. Output 'all' if no specific file is meant." )
 
 route_model = model.with_structured_output(schema = route_schema)
-def route_node(state : cragstate)->dict:
+async def route_node(state : cragstate)->dict:
     global STORE_FILENAMES
     query = state["query"]
     history = state["messages"]
@@ -159,8 +161,8 @@ def route_node(state : cragstate)->dict:
         </user_query>""",
         input_variables=["query", "uploaded_files", "chat_context"]
     )
-    prompt = template.invoke({"query" : query , "uploaded_files" : filenames , "chat_context" : recent_history})
-    output = route_model.invoke(prompt)
+    prompt = await template.ainvoke({"query" : query , "uploaded_files" : filenames , "chat_context" : recent_history})
+    output = await route_model.ainvoke(prompt)
     state["specific_file"] = output.specific_file
     # print(f"🧭 ROUTER DECISION: Route to '{output.route_node}' for file '{output.specific_file}'") 
     return {"route_node" : output.route_node}
@@ -168,7 +170,7 @@ def route_node(state : cragstate)->dict:
 def routing_condition(state : cragstate)->Literal["Retriever" , "Direct_Chat" , "Research"]:
     return state["route_node"]
 
-def retriever_node(state : cragstate )->dict:
+async def retriever_node(state : cragstate )->dict:
     query = state["query"]
     specific_file = state.get("specific_file" , "all")
     if(not GLOBAL_VECTOR_STORE):
@@ -178,9 +180,9 @@ def retriever_node(state : cragstate )->dict:
         specific_file = 'all'
 
     if(specific_file.lower().strip() != "all"):
-        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,k = 10,  filter = {"source" : specific_file})
+        rel_docs = await GLOBAL_VECTOR_STORE.asimilarity_search(query ,k = 10,  filter = {"source" : specific_file})
     else:
-        rel_docs = GLOBAL_VECTOR_STORE.similarity_search(query ,  k = 10)
+        rel_docs = await GLOBAL_VECTOR_STORE.asimilarity_search(query ,  k = 10)
 
     retrieved_images = []
     for doc in rel_docs:
@@ -200,7 +202,7 @@ class image_evaluator_schema(BaseModel):
     Grade : Literal["CORRECT" , "INCORRECT"] = Field(description="Grading of the document relative to the user's query")
 img_eval_model = model.with_structured_output(schema = image_evaluator_schema)
 
-def evaluator(state : cragstate)->dict:
+async def evaluator(state : cragstate)->dict:
     rel_docs = state.get("rel_docs" , [])
     query = state["query"]
     rel_images = state.get("rel_images" , [])
@@ -238,7 +240,7 @@ def evaluator(state : cragstate)->dict:
 
     evaluator_chain = template | evaluator_model
     batch_input = [{"query" : query , "document" : f"[Source File : {doc.metadata.get('source' , 'unknown')}] \n{doc.page_content}"} for doc in rel_docs]
-    output = evaluator_chain.batch(batch_input)
+    output = await evaluator_chain.abatch(batch_input)
 
     correct_docs = []
     ambigous_docs = []
@@ -276,12 +278,12 @@ def evaluator(state : cragstate)->dict:
             },
             {"type" : "image_url", "image_url" : {"url" : img}}]
         )])
-        
-    img_output = img_eval_model.batch(batch_messages)
+    if(batch_messages):
+        img_output = await img_eval_model.abatch(batch_messages)
 
-    for img , grade in zip(rel_images , img_output):
-        if grade.Grade.strip().upper() == "CORRECT":
-            correct_images.append(img)
+        for img , grade in zip(rel_images , img_output):
+            if grade.Grade.strip().upper() == "CORRECT":
+                correct_images.append(img)
     return {"correct_images" : correct_images , "correct_docs" : correct_docs  , "ambigous_docs" : ambigous_docs , "incorrect_docs" : incorrect_docs}
 
 
@@ -308,14 +310,14 @@ def check_condition(state: cragstate)->Literal["Research" , "Refine"]:
 
 
 tool = TavilySearchResults(max_results = 5)
-def tavily_search(query : str):
-    output = tool.invoke({"query" : query})
+async def tavily_search(query : str):
+    output = await tool.ainvoke({"query" : query})
     output_list = [Document(page_content = el.get("content" , "")) for el in output]
     return output_list
 
 
 
-def research(state : cragstate)->dict:
+async def research(state : cragstate)->dict:
     query = state["query"]
     history = state["messages"]
     recent_history = "\n".join([f"{msg.type} : {msg.content}" for msg in history[-5 : ]] if history else "No previous history") 
@@ -335,8 +337,10 @@ def research(state : cragstate)->dict:
     Queries:""",
         input_variables=["chat_context" , "query"]
     )
-    output = model.invoke(template.invoke({"query" : query , "chat_context" : recent_history})).content.strip()
-    web_results = tavily_search(output)
+    prompt = await template.ainvoke({"query" : query , "chat_context" : recent_history})
+    output_res = await model.ainvoke(prompt)
+    output = output_res.content.strip()
+    web_results = await tavily_search(output)
     return {"research_docs" : web_results}
 
 
@@ -350,7 +354,7 @@ def break_into_sentences(text : str)->List[str]:
     sentences = re.split(r"(?<=[.!?])\s+" , text)
     return sentences
 
-def refine(state : cragstate)->dict:
+async def refine(state : cragstate)->dict:
     query = state["query"]
     # correct_string = " ".join(doc.page_content for doc in state["correct_docs"]).strip()
     ambigous_string = " ".join(doc.page_content for doc in state.get("ambigous_docs" , [])).strip()
@@ -373,7 +377,7 @@ def refine(state : cragstate)->dict:
         input_variables=["query" , "sentence"]
     )
     refine_chain = template | refine_model
-    output = refine_chain.batch(batch_input)
+    output = await refine_chain.abatch(batch_input)
     refined_list = []
     for sentence , to_keep in zip(sentences , output):
         if(to_keep.keep):
@@ -381,7 +385,7 @@ def refine(state : cragstate)->dict:
     return {"refined_list_sentences" : refined_list}
 
 
-def generate(state : cragstate)->dict:
+async def generate(state : cragstate)->dict:
 
     global GLOBAL_VECTOR_STORE
     if(not GLOBAL_VECTOR_STORE):
@@ -432,11 +436,11 @@ def generate(state : cragstate)->dict:
     for img in correct_images:
         content_payload.append({"type" : "image_url" , "image_url" : {"url" : img}})
 
-    ans = model.invoke([HumanMessage(content = content_payload)])
+    ans = await model.ainvoke([HumanMessage(content = content_payload)])
     return {"ans" : ans.content.strip() , "messages" : [ans]}
 
-def Direct_Chat(state: cragstate)->dict:
-    output = model.invoke(state["messages"])
+async def Direct_Chat(state: cragstate)->dict:
+    output =await model.ainvoke(state["messages"])
     return {"messages" : [output]  , "ans" : output.content.strip()}
 
 checkpoint = InMemorySaver()
@@ -459,6 +463,7 @@ graph.add_edge("Direct_Chat" , END)
 chatbot = graph.compile(checkpointer=checkpoint)
 
 from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
 import tempfile
 import os
 
@@ -469,10 +474,19 @@ class ChatRequest(BaseModel):
     thread_id : str = Field(default = "session_1" , description="The thread_id of the current chat")
 
 @app.post("/chat")
-def chat(request : ChatRequest):
+async def chat(request : ChatRequest):
     query = request.query
-    output = chatbot.invoke({"query" : query , "messages" : [("user" , query)]} , config = {"configurable" : {"thread_id" : request.thread_id}})
-    return {"answer" : output.get("ans" , "Sorry I could not generate an answer")}
+    thread_id = request.thread_id
+    async def event_generator():
+        async for event in chatbot.astream_events({"query" : query , "messages" : [("user" , query)]} , config = {"configurable" : {"thread_id" : thread_id}} ,version = "v2"):
+            kind = event["event"]
+            curr_node = event.get("metadata" , {}).get("langgraph_node")
+            allowed_nodes = ["Generate", "Direct_Chat"]
+            if kind == "on_chat_model_stream" and curr_node in allowed_nodes:
+                content = event["data"]["chunk"].content
+                if(content):
+                    yield content
+    return StreamingResponse(event_generator() , media_type="text/event-stream")
 
 @app.post("/upload")
 async def upload_documents(file : UploadFile = File(...)):
@@ -484,9 +498,9 @@ async def upload_documents(file : UploadFile = File(...)):
         tmp_path = tmp_file.name
     try:
         if(clean_file_extension == "pdf"):
-            process_pdf(filepath = tmp_path , filename = filename)
+            await process_pdf(filepath = tmp_path , filename = filename)
         else:
-            process_image(filepath = tmp_path , filename = filename)
+            await process_image(filepath = tmp_path , filename = filename)
         return {"message" : f"Successfully Processed {filename}"}
     finally:
         if os.path.exists(tmp_path):
